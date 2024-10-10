@@ -28,9 +28,9 @@ func initDB() *sql.DB {
         CREATE TABLE scheduler (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
-            title TEXT NOT NULL,
-            comment TEXT,
-            repeat TEXT
+            title VARCHAR(255) NOT NULL,
+            comment VARCHAR(500),
+            repeat VARCHAR(128)
         );
         CREATE INDEX idx_date ON scheduler(date);
         `

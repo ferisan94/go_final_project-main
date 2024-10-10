@@ -4,23 +4,20 @@ FROM golang:1.20 AS build
 # Устанавливаем рабочую директорию внутри контейнера
 WORKDIR /app
 
-# Копируем файлы go.mod и go.sum для загрузки зависимостей
-COPY go.mod go.sum ./
-
-# Загружаем зависимости
-RUN go mod tidy
-
 # Копируем все файлы проекта в контейнер
 COPY . .
 
+# Загружаем зависимости
+RUN go mod download
+
 # Собираем исполняемый файл
-RUN go build -o todo_server main.go date.go db.go api_task.go
+RUN go build -o todo_server .
 
 # Шаг 2: Используем минимальный образ для запуска приложения
-FROM ubuntu:latest
+FROM alpine:latest
 
 # Устанавливаем необходимые пакеты, включая SQLite
-RUN apt-get update && apt-get install -y sqlite3
+RUN apk --no-cache add sqlite
 
 # Устанавливаем рабочую директорию
 WORKDIR /app

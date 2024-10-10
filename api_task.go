@@ -4,9 +4,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 )
+
+// Определяем константу для формата даты
+const DateFormat = "20060102"
+
+// Определяем константу для для лимита задач
+const MaxTasksLimit = 50
 
 // Task представляет структуру задачи
 type Task struct {
@@ -24,7 +31,7 @@ func handleNextDate(w http.ResponseWriter, r *http.Request) {
 	repeat := r.FormValue("repeat")
 
 	// Парсим параметр now
-	now, err := time.Parse("20060102", nowStr)
+	now, err := time.Parse(DateFormat, nowStr)
 	if err != nil {
 		http.Error(w, "некорректный формат текущей даты", http.StatusBadRequest)
 		return
@@ -38,7 +45,9 @@ func handleNextDate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Отправляем результат
-	w.Write([]byte(nextDate))
+	if _, err := w.Write([]byte(nextDate)); err != nil {
+		log.Printf("Ошибка при записи ответа: %v", err)
+	}
 }
 
 // addTaskHandler обрабатывает HTTP-запросы для добавления новой задачи в базу данных
@@ -62,14 +71,14 @@ func addTaskHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 
 	// Получаем сегодняшнюю дату
-	now := time.Now().Format("20060102")
+	now := time.Now().Format(DateFormat)
 	if task.Date == "" {
 		task.Date = now // Если дата не указана, используем сегодняшнюю
 	} else {
 		// Проверяем формат даты
-		_, err := time.Parse("20060102", task.Date)
+		_, err := time.Parse(DateFormat, task.Date)
 		if err != nil {
-			http.Error(w, `{"error":"Неправильный формат даты. Ожидался формат 20060102"}`, http.StatusBadRequest)
+			http.Error(w, `{"error":"Неправильный формат даты. Ожидался формат YYYYMMDD"}`, http.StatusBadRequest)
 			return
 		}
 	}
@@ -119,20 +128,10 @@ func getTasksHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	limit := 50                           // Максимальное количество возвращаемых задач
-	search := r.URL.Query().Get("search") // Поиск по заголовку или комментарию
-
-	var rows *sql.Rows
 	var err error
 
-	// Формируем SQL-запрос
-	if search != "" {
-		searchPattern := "%" + search + "%"
-		rows, err = db.Query(`SELECT id, date, title, comment, repeat FROM scheduler WHERE title LIKE ? OR comment LIKE ? ORDER BY date LIMIT ?`, searchPattern, searchPattern, limit)
-	} else {
-		rows, err = db.Query(`SELECT id, date, title, comment, repeat FROM scheduler ORDER BY date LIMIT ?`, limit)
-	}
-
+	// Выполняем запрос без поиска
+	rows, err := db.Query(`SELECT id, date, title, comment, repeat FROM scheduler ORDER BY date LIMIT ?`, MaxTasksLimit)
 	if err != nil {
 		http.Error(w, `{"error": "Ошибка при получении задач"}`, http.StatusInternalServerError)
 		return
@@ -141,7 +140,6 @@ func getTasksHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	tasks := []Task{}
 
-	// Считываем задачи из результата
 	for rows.Next() {
 		var task Task
 		if err := rows.Scan(&task.ID, &task.Date, &task.Title, &task.Comment, &task.Repeat); err != nil {
@@ -149,6 +147,12 @@ func getTasksHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			return
 		}
 		tasks = append(tasks, task)
+	}
+
+	// Обработка ошибки, которая могла произойти во время итерации по строкам
+	if err = rows.Err(); err != nil {
+		http.Error(w, `{"error": "Ошибка при обработке строк результата"}`, http.StatusInternalServerError)
+		return
 	}
 
 	// Формируем ответ в формате JSON
@@ -213,45 +217,38 @@ func editTaskHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 
 	// Проверка на корректность формата даты
-	if _, err := time.Parse("20060102", task.Date); err != nil {
-		http.Error(w, `{"error":"Неправильный формат даты. Ожидался формат 20060102"}`, http.StatusBadRequest)
+	if _, err := time.Parse(DateFormat, task.Date); err != nil {
+		http.Error(w, `{"error":"Неправильный формат даты. Ожидался формат YYYYMMDD"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Проверка корректности поля repeat (если оно не должно содержать произвольные значения)
-	if task.Repeat != "" {
-		allowedRepeats := []string{"d 1", "d 5", "d 7"}
-		valid := false
-		for _, v := range allowedRepeats {
-			if task.Repeat == v {
-				valid = true
-				break
-			}
-		}
-		if !valid {
-			http.Error(w, `{"error":"Некорректное значение для repeat"}`, http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Проверка существования задачи
-	var exists int
-	err = db.QueryRow("SELECT COUNT(*) FROM scheduler WHERE id = ?", task.ID).Scan(&exists)
-	if err != nil {
-		http.Error(w, "Ошибка при проверке существования задачи", http.StatusInternalServerError)
+	// Проверка что поле Repeat не пустое
+	if task.Repeat == "" {
+		http.Error(w, `{"error":"Поле 'repeat' не может быть пустым"}`, http.StatusBadRequest)
 		return
 	}
 
-	if exists == 0 {
-		http.Error(w, `{"error": "Задача не найдена"}`, http.StatusNotFound)
-		return
-	}
-
-	// Выполнение обновления задачи в базе данных
-	_, err = db.Exec(`UPDATE scheduler SET date = ?, title = ?, comment = ?, repeat = ? WHERE id = ?`,
+	// Выполняем обновление задачи и проверяем количество затронутых строк
+	res, err := db.Exec(`
+		UPDATE scheduler 
+		SET date = ?, title = ?, comment = ?, repeat = ? 
+		WHERE id = ?`,
 		task.Date, task.Title, task.Comment, task.Repeat, task.ID)
+
 	if err != nil {
 		http.Error(w, "Ошибка при обновлении задачи", http.StatusInternalServerError)
+		return
+	}
+
+	// Проверяем, были ли затронуты строки
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		http.Error(w, "Ошибка при проверке результата обновления", http.StatusInternalServerError)
+		return
+	}
+
+	if rowsAffected == 0 {
+		http.Error(w, `{"error": "Задача не найдена"}`, http.StatusNotFound)
 		return
 	}
 
